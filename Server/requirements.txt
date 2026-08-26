@@ -1,0 +1,3 @@
+Flask
+mutagen
+psycopg[binary]

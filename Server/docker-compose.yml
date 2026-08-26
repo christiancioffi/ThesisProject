@@ -1,0 +1,62 @@
+services:
+  rest-server:
+    build: .
+    image: rest-server
+    container_name: rest-server
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "8443:8443"
+    environment:
+      - API_KEY=${API_KEY}
+      - ADMIN_KEY=${ADMIN_KEY}
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./AudioSamples:/app/AudioSamples
+      - ./logs:/app/logs
+      - ./NodesConfiguration:/app/NodesConfiguration
+    depends_on:
+      db-server:
+        condition: service_healthy
+  db-server:
+    image: postgres:latest
+    container_name: db-server
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./postgres_data:/var/lib/postgresql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql # Script per creare la tabella
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s  # Controlla ogni 10 secondi
+      timeout: 5s    # Tempo massimo per il check
+      retries: 5     # Quante volte riprovare prima di darsi per vinto
+      start_period: 15s # Dà a PostgreSQL 15 secondi per avviarsi prima di iniziare i controlli
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}
+      - GF_SMTP_ENABLED=true
+      - GF_SMTP_HOST=smtp.gmail.com:587
+      - GF_SMTP_USER=${GF_SMTP_USER}
+      - GF_SMTP_PASSWORD=${GF_SMTP_PASSWORD}
+      - GF_SMTP_FROM_ADDRESS=${GF_SMTP_FROM_ADDRESS}
+      - GF_SMTP_FROM_NAME=Grafana Monitoring
+      - GF_SMTP_STARTTLS_POLICY=MandatoryStartTLS
+    volumes:
+      - ./grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    depends_on:
+      db-server:
+        condition: service_healthy

@@ -1,0 +1,22 @@
+{
+    "adapter" : "i2c",
+    "i2c_address": "0x55",
+    "registry": {
+        "v_raw": "106",
+        "a_raw": "107",
+        "ai": "108",
+        "volt": "109",
+        "soc": "110",
+        "nom_capacity": "111",
+        "full_available_capacity": "112",
+        "remain_capacity": "114",
+        "avg_power": "115",
+        "soh": "118",
+        "temperature": "119",
+        "cycle_count": "120",
+        "passed_charge": "121",
+        "dod0": "122",
+        "discharge_current": "123",
+        "full_charge_capacity": "124"
+    }
+}

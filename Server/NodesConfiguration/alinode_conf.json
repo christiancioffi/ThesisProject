@@ -1,0 +1,11 @@
+{
+  "NODEID": "alinodev-1",
+  "IDLE_TIME": 295,
+  "TIME_OUT_OF_SYNC": 86400,
+  "LOG_UPLOAD_PERIOD": 43200,
+  "CONFIGURATION_DOWNLOAD_PERIOD": 43200,
+  "AUDIO_ENDPOINT": "https://tesi.aliagrid.com/audio",
+  "LOGS_ENDPOINT": "https://tesi.aliagrid.com/logs",
+  "CONFIGURATION_ENDPOINT": "https://tesi.aliagrid.com/configuration",
+  "MIN_YEAR_FOR_SYNC_CHECK": 2020
+}
