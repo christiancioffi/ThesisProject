@@ -1,7 +1,8 @@
 idf_component_register(
     SRCS 
         "main.cpp"
-        "CNN1D_RNN_10_int8.cpp"
+        "CNN1D_20_int8.cpp"
+        "CNN1D_20_float32.cpp"
         "MelSpectrogram.cpp" 
         "filter_module.cpp" 
         "mel_matrix.cpp" 

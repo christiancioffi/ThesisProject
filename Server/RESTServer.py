@@ -318,10 +318,10 @@ def predictions():
             raise Exception("Empty request body")
 
         for i, row in enumerate(reader):
-            if len(row) != 2:
-                raise Exception(f"Invalid CSV row at line {i}: expected 2 columns, got {len(row)}")
+            if len(row) != 3:
+                raise Exception(f"Invalid CSV row at line {i}: expected 3 columns, got {len(row)}")
 
-            timestamp_str, prediction_str = row[0].strip(), row[1].strip()
+            timestamp_str, prediction_int8_str, prediction_f32_str = row[0].strip(), row[1].strip(), row[2].strip()
 
             try:
                 datetime.strptime(timestamp_str, PREDICTIONS_DATE_FORMAT)
@@ -329,11 +329,16 @@ def predictions():
                 raise Exception(f"Invalid timestamp format at line {i}: {timestamp_str}")
 
             try:
-                prediction_val = float(prediction_str)
+                prediction_int8_val = float(prediction_int8_str)
             except Exception:
-                raise Exception(f"Invalid prediction value at line {i}: {prediction_str}")
+                raise Exception(f"Invalid prediction_int8 value at line {i}: {prediction_int8_str}")
 
-            rows.append((timestamp_str, prediction_val))
+            try:
+                prediction_f32_val = float(prediction_f32_str)
+            except Exception:
+                raise Exception(f"Invalid prediction_f32 value at line {i}: {prediction_f32_str}")
+
+            rows.append((timestamp_str, prediction_int8_val, prediction_f32_val))
 
         if not rows:
             raise Exception("No valid rows found in CSV")
@@ -367,8 +372,8 @@ def insert_predictions_into_db(rows):
     cursor = db.cursor()
 
     sql = """
-        INSERT INTO Predictions (timestamp, prediction)
-        VALUES (%s, %s)
+        INSERT INTO Predictions (timestamp, prediction_int8, prediction_f32)
+        VALUES (%s, %s, %s)
         """
 
     try:
@@ -384,7 +389,6 @@ def insert_predictions_into_db(rows):
             cursor.close()
         if db:
             db.close()
-
 
 @app.route('/logs', methods=['POST'])
 @api_key_required

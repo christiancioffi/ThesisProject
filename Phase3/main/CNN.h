@@ -1,13 +1,14 @@
-#ifndef CNN_RNN_H
-#define CNN_RNN_H
+#ifndef CNN_H
+#define CNN_H
 
 #include <stdint.h>
 
 // Allineamento a 16 byte richiesto dall'interprete di TensorFlow Lite Micro
 // per un accesso efficiente ai pesi memorizzati nella memoria Flash dell'ESP32.
-extern const unsigned char _model[];
-extern const unsigned int _model_len;
-
+extern const unsigned char _model_int8[];
+extern const unsigned int _model_int8_len;
+extern const unsigned char _model_f32[];
+extern const unsigned int _model_f32_len;
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -17,4 +18,4 @@ extern "C" {
 }
 #endif
 
-#endif // CNN_RNN_H
+#endif // CNN_H

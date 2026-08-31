@@ -28,6 +28,7 @@
 #include "I2SDriver.h"
 #include "sd_card.h"
 #include "inference.h"
+#include "MelSpectrogram.h"
 #include "ConfigLoader.h"
 #include "eg91_sender.h"
 #include "Logger.h"
@@ -49,7 +50,7 @@
 
 #define SD_MOUNT_POINT    "/sd"
 #define CSV_PATH SD_MOUNT_POINT "/predictions.csv"
-#define SLEEP_BETWEEN_CYCLES_MS   (5 * 60 *1000)      // 5 minuti
+#define SLEEP_BETWEEN_CYCLES_MS   (5 * 60 *1000)      // 5 minuti (5 * 60 *1000)
 #define SYNC_INTERVAL_SEC (12 * 3600) // 12 ore (in secondi)
 #define UPLOAD_INTERVAL_SEC (6 * 3600) // 6 ore (in secondi)
 #define MAX_SYNC_RETRIES 10
@@ -105,7 +106,7 @@ static bool init_storage() {
     if (f == NULL) {
         f = fopen(CSV_PATH, "w");
         if (f) {
-            fprintf(f, "timestamp,prediction\n");
+            fprintf(f, "timestamp,prediction_int8,prediction_f32\n");
             fflush(f);
             int fd = fileno(f);
             if (fd >= 0) {
@@ -385,7 +386,7 @@ static void send_predictions_to_server() {
             // Svuota/azzera il file CSV dopo l'upload riuscito
             FILE* f = fopen(CSV_PATH, "w");
             if (f) {
-                fprintf(f, "timestamp,prediction\n");
+                fprintf(f, "timestamp,prediction_int8,prediction_f32\n");
                 fflush(f);              // svuota il buffer di stdio
                 int fd = fileno(f);     // ottieni il file descriptor
                 if (fd >= 0) {
@@ -407,13 +408,13 @@ static void send_predictions_to_server() {
 // ---------------------------------------------------------------------------
 // Scrittura su CSV
 // ---------------------------------------------------------------------------
-static void append_prediction_to_csv(const char* timestamp_str, float prediction) {
+static void append_prediction_to_csv(const char* timestamp_str, float prediction_int8, float prediction_f32) {
     FILE* f = fopen(CSV_PATH, "a");
     if (f == NULL) {
         Logger::instance().error(LOG_TAG, "Unable to open %s in append mode", CSV_PATH);
         return;
     }
-    fprintf(f, "%s,%.8f\n", timestamp_str, prediction);
+    fprintf(f, "%s,%.8f,%.8f\n", timestamp_str, prediction_int8, prediction_f32);
     fflush(f);
     int fd = fileno(f);
     if (fd >= 0) {
@@ -516,9 +517,7 @@ extern "C" void app_main(void){
         Logger::instance().info(LOG_TAG, "========== End audio recording ==========");
 
         int64_t ts = get_timestamp_ms();
-        Logger::instance().debug(LOG_TAG, "Current timestamp (ms): %" PRId64, ts);
         ts -= 500;                              // Per il preprocessing
-        Logger::instance().debug(LOG_TAG, "Timestamp adjusted for preprocessing (ms): %" PRId64, ts);
 
         time_t sec = ts / 1000;
         int ms = ts % 1000;
@@ -538,20 +537,51 @@ extern "C" void app_main(void){
             continue;
         }
 
-        float prediction = inference_from_audio(pcm_buffer, TOTAL_SAMPLES);
-
-        if(prediction < 0.0f) {
-            Logger::instance().error(LOG_TAG, "Error during inference, skipping cycle.");
+        // Spettrogramma calcolato UNA VOLTA SOLA (filtro/trimming/Mel-spectrogram
+        // sono identici per le due varianti: dipendono solo dall'audio, non dal modello).
+        MelSpectrogram spectrogram = compute_spectrogram_from_audio(pcm_buffer, TOTAL_SAMPLES);
+        if (spectrogram.data == nullptr) {
+            Logger::instance().error(LOG_TAG, "Error during spectrogram computation, skipping cycle.");
             Logger::instance().info(LOG_TAG, "Sleeping for %d ms before next cycle...", SLEEP_BETWEEN_CYCLES_MS);
             vTaskDelay(pdMS_TO_TICKS(SLEEP_BETWEEN_CYCLES_MS));
             Logger::instance().info(LOG_TAG, "Woke up, starting next cycle...");
             continue;
         }
 
-        Logger::instance().info(LOG_TAG, "t=%s  prediction=%.8f", iso_timestamp, prediction);
+        Logger::instance().info(LOG_TAG, "Computing predictions for timestamp: %s", iso_timestamp);
+
+        int64_t start_int8 = esp_timer_get_time();
+        float prediction_int8 = inference_from_spectrogram(spectrogram, true);
+        int64_t duration_int8 = esp_timer_get_time() - start_int8;
+        Logger::instance().info(LOG_TAG, "Prediction (int8): %.8f (Time: %.3f ms)", prediction_int8, duration_int8 / 1000.0f);
+
+        int64_t start_f32 = esp_timer_get_time();
+        float prediction_f32 = inference_from_spectrogram(spectrogram, false);
+        int64_t duration_f32 = esp_timer_get_time() - start_f32;
+        Logger::instance().info(LOG_TAG, "Prediction (float32): %.8f (Time: %.3f ms)", prediction_f32, duration_f32 / 1000.0f);
+
+        free_mel_spectrogram(spectrogram);
+
+        if(prediction_int8 < 0.0f) {
+            Logger::instance().error(LOG_TAG, "Error during inference (int8), skipping cycle.");
+            Logger::instance().info(LOG_TAG, "Sleeping for %d ms before next cycle...", SLEEP_BETWEEN_CYCLES_MS);
+            vTaskDelay(pdMS_TO_TICKS(SLEEP_BETWEEN_CYCLES_MS));
+            Logger::instance().info(LOG_TAG, "Woke up, starting next cycle...");
+            continue;
+        }
+
+        if(prediction_f32 < 0.0f) {
+            Logger::instance().error(LOG_TAG, "Error during inference (float32), skipping cycle.");
+            Logger::instance().info(LOG_TAG, "Sleeping for %d ms before next cycle...", SLEEP_BETWEEN_CYCLES_MS);
+            vTaskDelay(pdMS_TO_TICKS(SLEEP_BETWEEN_CYCLES_MS));
+            Logger::instance().info(LOG_TAG, "Woke up, starting next cycle...");
+            continue;
+        }
+
+        Logger::instance().info(LOG_TAG, "t=%s  prediction_int8=%.8f  prediction_f32=%.8f", iso_timestamp, prediction_int8, prediction_f32);
 
         // Aggiunge la predizione al CSV
-        append_prediction_to_csv(iso_timestamp, prediction);
+        append_prediction_to_csv(iso_timestamp, prediction_int8, prediction_f32);
         
         // 2. Controllo e invio periodico del CSV al server (ogni 6 ore) - CORRETTO
         if (should_upload_time()) {
@@ -560,7 +590,7 @@ extern "C" void app_main(void){
         
         /*
 
-        // Salvataggio file audio locale
+        // 3. Salvataggio del file audio locale
         std::string safe_timestamp = time_buf;
         std::replace(safe_timestamp.begin(), safe_timestamp.end(), ':', '-');
 
@@ -568,9 +598,10 @@ extern "C" void app_main(void){
         snprintf(percorso_audio, sizeof(percorso_audio), "Audio/audio_%s.wav", safe_timestamp.c_str());
 
         save_audio(pcm_buffer, TOTAL_SAMPLES, percorso_audio);
-
+        
         */
 
+        
         Logger::instance().info(LOG_TAG, "Sleeping for %d ms before next cycle...", SLEEP_BETWEEN_CYCLES_MS);
         vTaskDelay(pdMS_TO_TICKS(SLEEP_BETWEEN_CYCLES_MS));
         Logger::instance().info(LOG_TAG, "Woke up, starting next cycle...");
