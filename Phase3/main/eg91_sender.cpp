@@ -315,18 +315,16 @@ Eg91Status Eg91Sender::send_command(std::string_view command, std::string& out_r
         : resp_timeout_ms(extract_cmd_key(command), kMinWaitTimeMs);
     wait_time = std::max(wait_time, kMinWaitTimeMs);
 
-    // RAII: acquisisce il lock di trasmissione per l'INTERA transazione e lo
-    // rilascia automaticamente all'uscita dallo scope, in ogni percorso
-    // (successo, errore di parsing, timeout) — sostituisce il try/finally
-    // che si userebbe con le eccezioni.
-    //
-    // Timeout di attesa del lock indipendente dal wait_time DI QUESTO comando:
-    // se un altro thread ha in corso una transazione piu' lunga (es. AT+QIACT,
-    // fino a 150s), un comando breve che arriva nel frattempo deve comunque
-    // aspettare il suo turno, non ricevere Busy prematuramente.
-    Eg91AtTransaction txn(rx_manager_, command, kMaxLockWaitMs);
+    // RAII: apre la transazione per l'INTERA durata del comando e la chiude
+    // automaticamente all'uscita dallo scope, in ogni percorso (successo,
+    // errore di parsing, timeout) — sostituisce il try/finally che si
+    // userebbe con le eccezioni. Il main task e' l'unico chiamante di
+    // send_command(), quindi qui non c'e' mai contesa da attendere: se
+    // acquired() e' false e' solo perche' il chiamante ha (erroneamente)
+    // annidato due transazioni senza il release() intermedio.
+    Eg91AtTransaction txn(rx_manager_, command);
     if (!txn.acquired()) {
-        Logger::instance().error(TAG, "Could not acquire UART transaction lock (another command in flight)");
+        Logger::instance().error(TAG, "Could not open UART transaction (nested acquire without release)");
         return Eg91Status::Busy;
     }
 
@@ -681,7 +679,7 @@ Eg91Status Eg91Sender::send_https_post_body(std::string_view body, std::string& 
     uint32_t wait_time = std::max<uint32_t>(
         resp_timeout_ms("AT+QHTTPPOST", static_cast<uint32_t>(timeout_s) * 1000), kMinWaitTimeMs);
 
-    Eg91AtTransaction txn(rx_manager_, "POST_BODY", kMaxLockWaitMs);
+    Eg91AtTransaction txn(rx_manager_, "POST_BODY");
     if (!txn.acquired()) return Eg91Status::Busy;
 
     Logger::instance().debug(TAG, "Sending POST body data...");

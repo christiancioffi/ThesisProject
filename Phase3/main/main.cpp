@@ -50,7 +50,8 @@
 
 #define SD_MOUNT_POINT    "/sd"
 #define CSV_PATH SD_MOUNT_POINT "/predictions.csv"
-#define SLEEP_BETWEEN_CYCLES_MS   (5 * 60 *1000)      // 5 minuti (5 * 60 *1000)
+#define LOG_PATH SD_MOUNT_POINT "/Log/log.txt"
+#define SLEEP_BETWEEN_CYCLES_MS   (5 * 60 * 1000)      // 5 minuti (5 * 60 * 1000)
 #define SYNC_INTERVAL_SEC (12 * 3600) // 12 ore (in secondi)
 #define UPLOAD_INTERVAL_SEC (6 * 3600) // 6 ore (in secondi)
 #define MAX_SYNC_RETRIES 10
@@ -469,7 +470,7 @@ extern "C" void app_main(void){
         return;
     }
 
-    Logger::instance().init("/sd/Log/log.txt", 2 * 1024 * 1024, 20);
+    Logger::instance().init(LOG_PATH, 2 * 1024 * 1024, 20);
 
 
     I2SDriver mic(I2S_BCLK_PIN, I2S_WS_PIN, I2S_DIN_PIN, SAMPLE_RATE_HZ);

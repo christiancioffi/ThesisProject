@@ -308,50 +308,65 @@ def predictions():
         raw_data = request.get_data().decode("utf-8")
 
         if not raw_data.strip():
-            raise Exception("Empty request body")
+            return jsonify({"status": "error", "message": "Empty request body"}), 400
 
-        rows = []
         reader = csv.reader(StringIO(raw_data))
-
         header = next(reader, None)  # salta la riga di intestazione
         if header is None:
-            raise Exception("Empty request body")
+            return jsonify({"status": "error", "message": "Empty request body or missing header"}), 400
 
-        for i, row in enumerate(reader):
+        valid_rows = []
+        errors = []
+
+        for i, row in enumerate(reader, start=1):
             if len(row) != 3:
-                raise Exception(f"Invalid CSV row at line {i}: expected 3 columns, got {len(row)}")
+                errors.append(f"Line {i}: expected 3 columns, got {len(row)}")
+                continue
 
             timestamp_str, prediction_int8_str, prediction_f32_str = row[0].strip(), row[1].strip(), row[2].strip()
 
             try:
                 datetime.strptime(timestamp_str, PREDICTIONS_DATE_FORMAT)
             except Exception:
-                raise Exception(f"Invalid timestamp format at line {i}: {timestamp_str}")
+                errors.append(f"Line {i}: invalid timestamp format ({timestamp_str})")
+                continue
 
             try:
                 prediction_int8_val = float(prediction_int8_str)
             except Exception:
-                raise Exception(f"Invalid prediction_int8 value at line {i}: {prediction_int8_str}")
+                errors.append(f"Line {i}: invalid prediction_int8 value ({prediction_int8_str})")
+                continue
 
             try:
                 prediction_f32_val = float(prediction_f32_str)
             except Exception:
-                raise Exception(f"Invalid prediction_f32 value at line {i}: {prediction_f32_str}")
+                errors.append(f"Line {i}: invalid prediction_f32 value ({prediction_f32_str})")
+                continue
 
-            rows.append((timestamp_str, prediction_int8_val, prediction_f32_val))
+            valid_rows.append((timestamp_str, prediction_int8_val, prediction_f32_val))
 
-        if not rows:
-            raise Exception("No valid rows found in CSV")
+        # Se non c'è nemmeno una riga valida, restituiamo errore 400
+        if not valid_rows:
+            return jsonify({
+                "status": "error",
+                "message": "No valid rows found in CSV"
+            }), 400
 
-        #print(f"Rows: {rows}")
+        # Salviamo solo la parte valida
+        insert_predictions_into_db(valid_rows)
+        insert_event_internal = "predictions_received" # o insert_event_into_db
+        insert_event_into_db(insert_event_internal)
 
-        insert_predictions_into_db(rows)
-        insert_event_into_db("predictions_received")
+        response_data = {
+            "status": "Partial success" if errors else "Predictions saved successfully",
+            "rows_inserted": len(valid_rows),
+            "rows_failed": len(errors)
+        }
+        
+        if errors:
+            response_data["errors"] = errors
 
-        return jsonify({
-            "status": "Predictions saved successfully",
-            "rows_inserted": len(rows)
-        })
+        return jsonify(response_data), 200
 
     except Exception as e:
         print(f"caught exception {type(e).__name__} {e}")
@@ -359,7 +374,6 @@ def predictions():
             "status": "error",
             "message": str(e)
         }), 400
-
 
 def insert_predictions_into_db(rows):
     db = None

@@ -18,22 +18,39 @@ struct AtResponse {
     std::string text;
 };
 
-// Gestore della ricezione UART, basato su multithreading FreeRTOS "classico":
+// Gestore della ricezione UART. Il sistema ha ESATTAMENTE due task che lo
+// toccano, mai di piu':
+//  - il "main task", che esegue un comando AT alla volta e ne attende la
+//    risposta (acquire -> uart_write_bytes -> wait_response -> release);
+//  - il "listener task" (listener_task_), l'unico thread che legge mai
+//    dall'hardware UART: resta bloccato sulla coda eventi nativa del
+//    driver e fa il parsing dei byte in arrivo.
 //
-//  - un task dedicato (listener_task_) resta bloccato sulla coda eventi nativa
-//    del driver UART e processa i byte in arrivo;
-//  - un mutex (command_mutex_) serializza le transazioni AT complete (invio +
-//    attesa risposta) tra thread chiamanti concorrenti: sulla EG91 c'e' UNA
-//    sola UART fisica, quindi due AT command in volo contemporaneamente
-//    corromperebbero lo stato. Nella versione precedente questo caso non era
-//    gestito correttamente;
-//  - un semaforo binario (data_ready_sem_) e' il punto di rendezvous tra il
-//    listener task (produttore) e il thread chiamante (consumatore) — lo
-//    stesso pattern di una condition variable, ma con il primitivo nativo
-//    FreeRTOS piu' leggero;
-//  - un secondo mutex, piu' fine (state_mutex_), protegge le poche variabili
-//    condivise (comando atteso, ultima risposta) scritte dal chiamante e
-//    lette dal listener task, o viceversa.
+// Regola d'oro che tutto il resto della classe rispetta: SOLO il listener
+// task chiama funzioni del driver UART che leggono/svuotano il buffer
+// (uart_read_bytes, uart_flush_input, uart_get_buffered_data_len). Il main
+// task non lo fa mai direttamente, nemmeno per "ripulire" lo stato prima di
+// una nuova transazione: se lo facesse, le due chiamate potrebbero
+// interfogliarsi in modo indefinito sullo stesso buffer del driver
+// (comportamento non documentato/non sicuro per chiamate concorrenti sulla
+// stessa porta), con il rischio concreto di perdere o duplicare byte della
+// risposta vera. Per questo una richiesta di pulizia del buffer hardware
+// (vedi flush_requested_ sotto) viene sempre delegata al listener e
+// attesa in modo sincrono dal main task, invece di essere eseguita in loco.
+//
+// Sincronizzazione fra i due task:
+//  - un semaforo binario (data_ready_sem_) e' il punto di rendezvous fra il
+//    listener (produttore) e il main task (consumatore) quando arriva una
+//    risposta valida;
+//  - un secondo semaforo binario (flush_done_sem_) e' l'analogo per la
+//    richiesta di pulizia del buffer hardware: il main task la richiede
+//    (flush_requested_ = true) e attende l'ack del listener;
+//  - un mutex leggero (state_mutex_) protegge le poche variabili condivise
+//    (comando atteso, ultima risposta) scritte dal main task e lette dal
+//    listener, o viceversa. Non serializza transazioni: con un solo
+//    chiamante, acquire()/release() sono gia' intrinsecamente sequenziali,
+//    quindi qui non serve (e non c'e' piu') un mutex "a grana grossa" per
+//    quello scopo.
 //
 // Uso tipico (vedi Eg91AtTransaction sotto per la RAII guard):
 //   AtResponse resp;
@@ -41,7 +58,7 @@ struct AtResponse {
 //       Eg91AtTransaction txn(rx_mgr, "AT+CREG?");
 //       uart_write_bytes(...);
 //       if (!rx_mgr.wait_response(5000, resp)) { /* timeout */ }
-//   } // il mutex viene rilasciato automaticamente qui, anche in caso di timeout
+//   } // il "diritto di trasmissione" viene rilasciato qui, anche in caso di timeout
 class UartRxManager {
 public:
     UartRxManager() = default;
@@ -53,22 +70,40 @@ public:
     // Crea mutex/semafori/task. Il chiamante deve aver gia' fatto
     // uart_driver_install() e passare qui la coda eventi ottenuta.
     [[nodiscard]] bool init(uart_port_t uart_num, QueueHandle_t uart_event_queue);
+
+    // Ferma il listener task e libera le risorse. A differenza della
+    // versione precedente NON forza la cancellazione del task dall'esterno:
+    // segnala l'uscita (running_ = false) e attende che sia il task stesso
+    // a terminare il proprio ciclo e a cancellarsi (vedi listener_task()).
+    // Questo e' l'unico modo sicuro di far girare i distruttori C++ dei
+    // suoi oggetti locali (accumulated_data, il buffer di lettura, ecc.):
+    // un vTaskDelete() chiamato dall'esterno su un task ancora vivo NON
+    // esegue lo stack unwinding, quindi la memoria heap posseduta da quegli
+    // oggetti locali resterebbe persa per sempre (memory leak) ad ogni
+    // deinit()/reinit, e se il task fosse stato interrotto a meta' di una
+    // sezione protetta da state_mutex_ il mutex resterebbe "preso" per
+    // sempre, condannando qualunque futura xSemaphoreTake su di esso.
     void deinit();
 
-    // Svuota il buffer RX hardware e lo stato interno. Sicura da chiamare in
-    // qualsiasi momento anche con altri thread attivi: acquisisce essa stessa
-    // command_mutex_, quindi attende che una transazione in corso su un altro
-    // thread finisca prima di procedere (e blocca nuove acquisizioni nel frattempo).
+    // Svuota lo stato software (pending_command_/last_response_) e chiede
+    // al listener di svuotare anche il buffer hardware della UART (vedi
+    // flush_requested_). Sicura da chiamare in qualsiasi momento: essendoci
+    // un solo possibile chiamante (il main task), non serve alcuna
+    // serializzazione con altre transazioni.
     void clear_state();
 
     // --- API a basso livello, usata da Eg91AtTransaction ---
 
-    // Blocca finche' non ottiene il diritto esclusivo di trasmissione (o scade
-    // lock_timeout_ms). Svuota anche il buffer hardware della UART prima di
-    // iniziare la nuova transazione, per scartare eventuali byte residui di
-    // una risposta arrivata in ritardo dopo un timeout (vedi commento nel .cpp).
-    [[nodiscard]] bool acquire(std::string_view command, uint32_t lock_timeout_ms = portMAX_DELAY);
-    // Rilascia il diritto di trasmissione. Va chiamato sempre dopo acquire(), in coppia.
+    // Segna l'inizio di una transazione per "command" e chiede al listener
+    // di ripulire il buffer hardware prima di ritornare, cosi' un'eventuale
+    // risposta "in ritardo" della transazione precedente (tipicamente un
+    // retry con lo STESSO comando dopo un timeout) non puo' soddisfare per
+    // sbaglio il pattern atteso della nuova transazione. Ritorna false solo
+    // se una transazione e' gia' attiva (uso scorretto dell'API: acquire()
+    // senza il release() corrispondente), non essendoci piu' concorrenza da
+    // arbitrare con un lock.
+    [[nodiscard]] bool acquire(std::string_view command);
+    // Chiude la transazione corrente. Va chiamato sempre dopo acquire(), in coppia.
     void release() noexcept;
     // Attende la risposta della transazione corrente (deve essere chiamato tra acquire/release).
     [[nodiscard]] bool wait_response(uint32_t wait_time_ms, AtResponse& out);
@@ -77,13 +112,21 @@ private:
     void listener_task();
     static void listener_task_trampoline(void* arg);
 
+    // Richiede al listener di svuotare il buffer hardware della UART e
+    // attende il suo ack (con timeout, per non rischiare un deadlock
+    // permanente del main task se il listener fosse inaspettatamente
+    // bloccato). E' l'UNICO punto in cui il main task interagisce -
+    // indirettamente, tramite il listener - con il buffer hardware.
+    void request_flush_and_wait();
+
     uart_port_t uart_num_ = UART_NUM_MAX;
     QueueHandle_t uart_event_queue_ = nullptr;
     TaskHandle_t listener_task_handle_ = nullptr;
 
-    SemaphoreHandle_t command_mutex_ = nullptr; // serializza le transazioni intere
     SemaphoreHandle_t state_mutex_ = nullptr;   // protegge pending_command_/last_response_
     SemaphoreHandle_t data_ready_sem_ = nullptr;
+    SemaphoreHandle_t flush_done_sem_ = nullptr; // ack del listener a una richiesta di flush
+    SemaphoreHandle_t task_exited_sem_ = nullptr; // dato dal listener appena prima di auto-cancellarsi
 
     ATCommandsParser parser_;
 
@@ -100,23 +143,35 @@ private:
     std::string pending_command_;
     std::string last_response_;
     bool response_is_error_ = false;
-    // Incrementato ad ogni acquire(): permette al listener task di scartare
-    // un match "in ritardo" che appartiene a una transazione gia' conclusa
-    // (timeout) invece di attribuirlo per errore a quella successiva.
+    // Incrementato ad ogni acquire()/clear_state(): permette al listener
+    // task di scartare un match "in ritardo" che appartiene a una
+    // transazione gia' conclusa (timeout) invece di attribuirlo per errore
+    // a quella successiva.
     uint32_t transaction_id_ = 0;
+
+    // Vero fra un acquire() e il release() corrispondente. Letta e scritta
+    // solo dal main task (unico chiamante di acquire/release), quindi non
+    // e' un dato condiviso con il listener e non necessita di alcun lock:
+    // serve solo a impedire un uso scorretto dell'API (acquire() annidati).
+    bool transaction_active_ = false;
+
+    // Richiesta di pulizia del buffer hardware: scritta dal main task
+    // (request_flush_and_wait) e letta/azzerata dal listener task, quindi
+    // DEVE essere atomica per garantire la visibilita' tra i due thread
+    // (qui non e' protetta da state_mutex_ perche' va controllata dal
+    // listener ad ogni giro di loop, anche quando non c'e' nessun evento
+    // UART da processare).
+    std::atomic<bool> flush_requested_{false};
 
     std::atomic<bool> running_{false};
 };
 
-// RAII: sostituisce il pattern try/finally che si userebbe con le eccezioni
-// per garantire il rilascio del lock di trasmissione in ogni caso (successo,
-// errore, timeout). Con le eccezioni disattivate questo e' l'unico modo
-// corretto e sicuro per garantirlo.
+// RAII: garantisce la chiusura della transazione (release()) in ogni caso
+// (successo, errore, timeout), senza bisogno di eccezioni.
 class Eg91AtTransaction {
 public:
-    Eg91AtTransaction(UartRxManager& mgr, std::string_view command,
-                       uint32_t lock_timeout_ms = portMAX_DELAY)
-        : mgr_(mgr), acquired_(mgr.acquire(command, lock_timeout_ms)) {}
+    Eg91AtTransaction(UartRxManager& mgr, std::string_view command)
+        : mgr_(mgr), acquired_(mgr.acquire(command)) {}
 
     ~Eg91AtTransaction() {
         if (acquired_) mgr_.release();

@@ -158,12 +158,6 @@ private:
     static constexpr int kMaxRetries = 2;
     static constexpr size_t kMaxBufferSize = 2048;
     static constexpr uint32_t kMinWaitTimeMs = 7000;
-    // Tempo massimo di attesa del lock di trasmissione quando un altro thread
-    // ha gia' una transazione in corso: deve coprire il caso peggiore tra
-    // tutti i timeout di max_resp_time_ (il piu' lungo e' AT+QIACT, 150s),
-    // con un margine, altrimenti un comando breve in coda a uno lungo
-    // riceverebbe Busy anche se quello lungo sta procedendo normalmente.
-    static constexpr uint32_t kMaxLockWaitMs = 160000;
 
     bool uart_installed_ = false;
     bool powered_on_ = false;

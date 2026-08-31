@@ -13,6 +13,26 @@ static const char* TAG = "UartRxManager";
 namespace {
 constexpr size_t kReadChunkSize = 512;
 
+// Timeout della xQueueReceive nel loop del listener. Deve essere basso: e'
+// anche la granularita' con cui il listener si accorge (a) di una richiesta
+// di flush del main task e (b) dello spegnimento (running_ = false). Con un
+// solo comando AT alla volta e timeout minimi nell'ordine dei secondi (vedi
+// kMinWaitTimeMs in eg91_sender.h), un'attesa fino a qualche decina di ms in
+// piu' per la richiesta di flush e' del tutto trascurabile.
+constexpr uint32_t kQueueWaitMs = 50;
+
+// Timeout con cui il main task attende l'ack di una richiesta di flush dal
+// listener (request_flush_and_wait). Ampio margine rispetto a kQueueWaitMs:
+// se scade davvero, il listener e' bloccato per qualche altra ragione (bug),
+// e si preferisce proseguire comunque piuttosto che bloccare per sempre il
+// main task.
+constexpr uint32_t kFlushAckWaitMs = 1000;
+
+// Timeout con cui deinit() attende che il listener task esca dal proprio
+// ciclo e si auto-cancelli, prima di ricorrere (come ultima spiaggia) a un
+// vTaskDelete esterno.
+constexpr uint32_t kShutdownWaitMs = 2000;
+
 // Limite di sicurezza per accumulated_data: se il pattern atteso non
 // matcha mai (comando non riconosciuto, desync, rumore sulla linea), senza
 // un tetto il buffer crescerebbe senza limite fino al prossimo cambio di
@@ -76,11 +96,12 @@ bool UartRxManager::init(uart_port_t uart_num, QueueHandle_t uart_event_queue) {
     uart_num_ = uart_num;
     uart_event_queue_ = uart_event_queue;
 
-    command_mutex_ = xSemaphoreCreateMutex();
     state_mutex_ = xSemaphoreCreateMutex();
     data_ready_sem_ = xSemaphoreCreateBinary();
+    flush_done_sem_ = xSemaphoreCreateBinary();
+    task_exited_sem_ = xSemaphoreCreateBinary();
 
-    if (!command_mutex_ || !state_mutex_ || !data_ready_sem_) {
+    if (!state_mutex_ || !data_ready_sem_ || !flush_done_sem_ || !task_exited_sem_) {
         Logger::instance().error(TAG, "Failed to create synchronization primitives");
         deinit();
         return false;
@@ -102,6 +123,7 @@ bool UartRxManager::init(uart_port_t uart_num, QueueHandle_t uart_event_queue) {
 
     if (ok != pdPASS) {
         Logger::instance().error(TAG, "Failed to create UART listener task");
+        running_ = false;
         deinit();
         return false;
     }
@@ -111,14 +133,33 @@ bool UartRxManager::init(uart_port_t uart_num, QueueHandle_t uart_event_queue) {
 }
 
 void UartRxManager::deinit() {
-    running_ = false;
+    if (running_) {
+        // Segnala l'uscita: il listener la vede al piu' dopo kQueueWaitMs
+        // (vedi listener_task()) e termina il proprio ciclo normalmente,
+        // lasciando che i suoi oggetti locali (accumulated_data, il buffer
+        // di lettura, cmd_copy) vengano distrutti regolarmente prima di
+        // auto-cancellarsi con vTaskDelete(nullptr).
+        running_ = false;
+    }
+
     if (listener_task_handle_) {
-        vTaskDelete(listener_task_handle_);
+        if (xSemaphoreTake(task_exited_sem_, pdMS_TO_TICKS(kShutdownWaitMs)) != pdTRUE) {
+            // Non dovrebbe mai succedere in condizioni normali: significa
+            // che il listener non e' riuscito a uscire dal proprio ciclo
+            // entro un tempo ragionevole. Come ultima spiaggia si forza la
+            // cancellazione dall'esterno, accettando il rischio di leak
+            // discusso nell'header, piuttosto che bloccare per sempre lo
+            // spegnimento del sistema.
+            Logger::instance().error(TAG, "Listener task did not exit in time, forcing deletion");
+            vTaskDelete(listener_task_handle_);
+        }
         listener_task_handle_ = nullptr;
     }
-    if (command_mutex_) { vSemaphoreDelete(command_mutex_); command_mutex_ = nullptr; }
+
     if (state_mutex_) { vSemaphoreDelete(state_mutex_); state_mutex_ = nullptr; }
     if (data_ready_sem_) { vSemaphoreDelete(data_ready_sem_); data_ready_sem_ = nullptr; }
+    if (flush_done_sem_) { vSemaphoreDelete(flush_done_sem_); flush_done_sem_ = nullptr; }
+    if (task_exited_sem_) { vSemaphoreDelete(task_exited_sem_); task_exited_sem_ = nullptr; }
 }
 
 void UartRxManager::listener_task_trampoline(void* arg) {
@@ -139,7 +180,25 @@ void UartRxManager::listener_task() {
     bool has_accumulated_transaction = false;
 
     while (running_) {
-        if (xQueueReceive(uart_event_queue_, &event, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        // Una richiesta di flush ha priorita' su qualunque evento UART_DATA
+        // gia' in coda: se la servissimo dopo aver processato un evento
+        // vecchio, quei byte "stale" finirebbero comunque accumulati e
+        // rischierebbero di soddisfare per sbaglio il pattern di un
+        // comando identico appena ri-acquisito (vedi commento su
+        // flush_requested_ nell'header). Questo e' anche l'UNICO altro
+        // punto, oltre al blocco UART_DATA sotto, in cui il listener tocca
+        // il driver UART: nessun'altra parte del codice lo fa mai, cosi'
+        // uart_read_bytes/uart_flush_input non sono mai chiamate da due
+        // task in contemporanea sulla stessa porta.
+        if (flush_requested_.load(std::memory_order_acquire)) {
+            uart_flush_input(uart_num_);
+            accumulated_data.clear();
+            has_accumulated_transaction = false;
+            flush_requested_.store(false, std::memory_order_release);
+            xSemaphoreGive(flush_done_sem_);
+        }
+
+        if (xQueueReceive(uart_event_queue_, &event, pdMS_TO_TICKS(kQueueWaitMs)) != pdTRUE) {
             continue;
         }
         if (event.type != UART_DATA) {
@@ -163,7 +222,7 @@ void UartRxManager::listener_task() {
         Logger::instance().debug(TAG, "Data: %.*s", len, data.data());
 
         // Sezione critica breve: legge il comando atteso e l'id della
-        // transazione corrente (scritti dal thread chiamante in acquire()).
+        // transazione corrente (scritti dal main task in acquire()).
         xSemaphoreTake(state_mutex_, portMAX_DELAY);
         std::string cmd_copy = pending_command_;
         uint32_t id_snapshot = transaction_id_;
@@ -236,20 +295,38 @@ void UartRxManager::listener_task() {
         }
     }
 
+    Logger::instance().debug(TAG, "Listener task exiting normally");
+
+    // Uscita pulita: gli oggetti locali (accumulated_data, buffer, cmd_copy
+    // gia' fuori scope) vengono distrutti qui dal normale stack unwinding,
+    // PRIMA che il task si auto-cancelli. E' questo che deinit() aspetta
+    // (task_exited_sem_) invece di forzare un vTaskDelete dall'esterno.
+    xSemaphoreGive(task_exited_sem_);
     vTaskDelete(nullptr);
 }
 
-void UartRxManager::clear_state() {
-    // Serializzata con command_mutex_: se un altro thread ha una transazione
-    // in corso, questa chiamata attende che finisca invece di corromperne lo
-    // stato (bug presente nella versione precedente).
-    xSemaphoreTake(command_mutex_, portMAX_DELAY);
+void UartRxManager::request_flush_and_wait() {
+    // Drena un eventuale ack "in ritardo" di una precedente richiesta di
+    // flush andata in timeout: se il listener l'avesse comunque completata
+    // e dato il semaforo DOPO che qui avevamo gia' smesso di aspettare,
+    // quel "give" resterebbe pendente e verrebbe altrimenti consumato dalla
+    // prossima xSemaphoreTake qui sotto, facendola ritornare subito come se
+    // IL FLUSH CORRENTE fosse gia' avvenuto - mentre magari il listener non
+    // l'ha ancora nemmeno iniziato. Stesso principio con cui data_ready_sem_
+    // viene drenato in acquire()/clear_state().
+    xSemaphoreTake(flush_done_sem_, 0);
 
-    uint8_t dump[256];
-    int len;
-    do {
-        len = uart_read_bytes(uart_num_, dump, sizeof(dump), 0);
-    } while (len > 0);
+    flush_requested_.store(true, std::memory_order_release);
+    if (xSemaphoreTake(flush_done_sem_, pdMS_TO_TICKS(kFlushAckWaitMs)) != pdTRUE) {
+        Logger::instance().error(TAG, "Listener task did not acknowledge flush request in time");
+        // Si prosegue comunque: nel peggiore dei casi un residuo di byte
+        // stale potrebbe sopravvivere nel buffer hardware, ma bloccare per
+        // sempre il main task sarebbe peggio di questo rischio residuo.
+    }
+}
+
+void UartRxManager::clear_state() {
+    request_flush_and_wait();
 
     xSemaphoreTake(state_mutex_, portMAX_DELAY);
     pending_command_.clear();
@@ -259,36 +336,26 @@ void UartRxManager::clear_state() {
     xSemaphoreGive(state_mutex_);
 
     xSemaphoreTake(data_ready_sem_, 0); // drena eventuali segnalazioni residue
-
-    xSemaphoreGive(command_mutex_);
 }
 
-bool UartRxManager::acquire(std::string_view command, uint32_t lock_timeout_ms) {
-    TickType_t ticks = (lock_timeout_ms == portMAX_DELAY)
-        ? portMAX_DELAY
-        : pdMS_TO_TICKS(lock_timeout_ms);
-
-    if (xSemaphoreTake(command_mutex_, ticks) != pdTRUE) {
-        return false; // un'altra transazione e' gia' in corso su un altro thread
+bool UartRxManager::acquire(std::string_view command) {
+    if (transaction_active_) {
+        // Uso scorretto dell'API (acquire() senza il release() precedente):
+        // con un solo chiamante non c'e' concorrenza da arbitrare, quindi
+        // qui e' sempre e solo un bug del chiamante, non contesa reale.
+        Logger::instance().error(TAG, "acquire() called while a transaction is already active");
+        return false;
     }
+    transaction_active_ = true;
 
-    // Scarta eventuali byte gia' presenti nel buffer hardware della UART:
-    // residuo di una risposta arrivata in ritardo per la transazione
-    // precedente (es. dopo un timeout). transaction_id_ protegge gia' dal
-    // caso in cui il nuovo comando sia DIVERSO dal precedente (still_current
-    // scarta il match se la transazione e' cambiata), ma non basta se il
-    // nuovo comando e' IDENTICO al vecchio (retry dopo timeout): in quel
-    // caso una risposta stale soddisferebbe comunque il pattern atteso e
-    // verrebbe scambiata per la risposta fresca. Svuotare qui il buffer
-    // hardware prima di iniziare la nuova transazione elimina anche
-    // l'eventuale evento UART_DATA gia' in coda per quei byte: quando il
-    // listener task lo processera', uart_get_buffered_data_len() trovera'
-    // 0 byte disponibili e lo scartera' prima di arrivare all'accumulo.
-    uint8_t drain_buf[256];
-    int drain_len;
-    do {
-        drain_len = uart_read_bytes(uart_num_, drain_buf, sizeof(drain_buf), 0);
-    } while (drain_len > 0);
+    // Chiede al listener di svuotare il buffer hardware PRIMA di impostare
+    // il nuovo pending_command_: cosi' un eventuale evento UART_DATA gia'
+    // in coda con byte residui della transazione precedente trovera'
+    // "0 byte disponibili" una volta processato (perche' nel frattempo il
+    // listener li ha gia' scartati) e verra' ignorato, invece di essere
+    // accumulato e confrontato per errore contro il pattern del comando
+    // NUOVO (specialmente pericoloso se e' un retry con lo stesso comando).
+    request_flush_and_wait();
 
     xSemaphoreTake(state_mutex_, portMAX_DELAY);
     pending_command_ = command;
@@ -307,7 +374,7 @@ void UartRxManager::release() noexcept {
     pending_command_.clear();
     xSemaphoreGive(state_mutex_);
 
-    xSemaphoreGive(command_mutex_);
+    transaction_active_ = false;
 }
 
 bool UartRxManager::wait_response(uint32_t wait_time_ms, AtResponse& out) {
