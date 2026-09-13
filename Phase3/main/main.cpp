@@ -51,9 +51,9 @@
 #define SD_MOUNT_POINT    "/sd"
 #define CSV_PATH SD_MOUNT_POINT "/predictions.csv"
 #define LOG_PATH SD_MOUNT_POINT "/Log/log.txt"
-#define SLEEP_BETWEEN_CYCLES_MS   (5 * 60 * 1000)      // 5 minuti (5 * 60 * 1000)
+#define SLEEP_BETWEEN_CYCLES_MS   (5 * 1000)      // 5 minuti (5 * 60 * 1000)   #TODO2
 #define SYNC_INTERVAL_SEC (12 * 3600) // 12 ore (in secondi)
-#define UPLOAD_INTERVAL_SEC (6 * 3600) // 6 ore (in secondi)
+#define UPLOAD_INTERVAL_SEC (6) // 6 ore (in secondi) (6 * 3600)
 #define MAX_SYNC_RETRIES 10
 #define UPLOAD_URL "https://tesi.aliagrid.com/predictions"    // ec2-3-122-216-71.eu-central-1.compute.amazonaws.com:8443
 

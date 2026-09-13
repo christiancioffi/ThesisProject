@@ -60,10 +60,25 @@ class Eg91Sender():
             self.UART_RX_PIN = uart_rx_pin
             self.LTE_POWER_PIN = lte_power_pin
             self.LTE_RESET_PIN = lte_reset_pin
-            self.IDLE_TIME_POWER_CYCLE_STEP_1=1 #s
-            self.IDLE_TIME_POWER_CYCLE_STEP_2=15    #s
-            self.RESET_TIME_STEP_1=300 #ms
-            self.RESET_TIME_STEP_2=15000 #ms
+            # Impulso PWRKEY per l'accensione: richiesto >=500ms dal datasheet.
+            self.POWER_ON_PULSE_TIME=1          #s
+            # Attesa dopo l'impulso di accensione prima che il modulo sia
+            # pronto (boot completo attorno ai 12-13s, teniamo un margine).
+            self.POWER_ON_SETTLE_TIME=15        #s
+            # Impulso PWRKEY per lo spegnimento via hardware (fallback se
+            # AT+QPOWD fallisce): richiesto >=650ms.
+            self.SHUTDOWN_PULSE_TIME=1          #s
+            # Attesa dopo AT+QPOWD / impulso PWRKEY prima che il modulo sia
+            # realmente spento: la procedura di power-down puo' richiedere
+            # fino a ~30s. Attendere meno rischia di tagliare l'alimentazione
+            # a procedura non conclusa (rischio di danneggiare la flash
+            # interna, nota esplicita del datasheet).
+            self.SHUTDOWN_SETTLE_TIME=30        #s
+            # Impulso RESET_N: finestra richiesta dal datasheet 150-460ms.
+            self.RESET_TIME_STEP_1=300          #ms
+            # Attesa dopo il rilascio di RESET_N prima che il modulo abbia
+            # riavviato e sia di nuovo pronto.
+            self.RESET_TIME_STEP_2=15000        #ms
             self.POWERED_ON=False
 
             self._network_registered = False
@@ -147,40 +162,97 @@ class Eg91Sender():
         except Exception as e:
             Logging.log_error(f"Error during EG91 deinitialization: \"{e}\"")
 
-    def _power_on(self):
-        # Power cycle
+    def _power_on(self) -> bool:
+        """
+        Accende il modulo EG91. PWRKEY COMMUTA lo stato del modulo (spento
+        -> acceso o acceso -> spento a seconda della durata dell'impulso),
+        non lo forza in uno stato preciso: se il modulo era gia' acceso
+        (sessione precedente non spenta correttamente, VBAT mai rimossa,
+        ecc.) un impulso pensato per "accenderlo" lo spegnerebbe invece.
+        Verifichiamo sempre lo stato reale prima di decidere se pulsare, e
+        di nuovo dopo l'impulso per confermare l'esito.
+        """
         Logging.log_info("Powering on EG91 module...")
+
+        if self._is_module_on():
+            Logging.log_info("EG91 module was already powered on, skipping PWRKEY pulse")
+            return True
+
         Pin(self.LTE_POWER_PIN, Pin.OUT).on()
-        time.sleep(self.IDLE_TIME_POWER_CYCLE_STEP_1)
+        time.sleep(self.POWER_ON_PULSE_TIME)
         Pin(self.LTE_POWER_PIN, Pin.OUT).off()
-        time.sleep(self.IDLE_TIME_POWER_CYCLE_STEP_2)
+        time.sleep(self.POWER_ON_SETTLE_TIME)
+
+        if not self._is_module_on():
+            Logging.log_error("EG91 module did not respond after power-on pulse")
+            return False
+
         Logging.log_info("EG91 module powered on successfully")
-    
-    def _shut_down(self):
+        return True
+
+    def _shut_down(self) -> bool:
+        """
+        Spegne il modulo EG91. Prova prima la via "sicura" raccomandata da
+        Quectel (AT+QPOWD); se il modulo non risponde, ricade sull'impulso
+        hardware su PWRKEY. Come in _power_on(), PWRKEY commuta lo stato
+        invece di forzarlo: se il modulo e' gia' spento non lo tocchiamo
+        affatto, per non riaccenderlo per errore.
+        """
         Logging.log_info("Shutting down EG91 module...")
-        Pin(self.LTE_POWER_PIN, Pin.OUT).on()
-        time.sleep(self.IDLE_TIME_POWER_CYCLE_STEP_1)
-        Pin(self.LTE_POWER_PIN, Pin.OUT).off()
-        time.sleep(self.IDLE_TIME_POWER_CYCLE_STEP_2)
+
+        if not self._is_module_on():
+            Logging.log_info("EG91 module was already powered off")
+            return True
+
+        graceful = False
+        try:
+            self._send_command("AT+QPOWD", wait_time=self.MAX_RESP_TIME["AT+QPOWD"])
+            graceful = True
+        except Exception as e:
+            Logging.log_error(f"AT+QPOWD failed or timed out, falling back to PWRKEY pulse: \"{e}\"")
+
+        if not graceful:
+            Pin(self.LTE_POWER_PIN, Pin.OUT).on()
+            time.sleep(self.SHUTDOWN_PULSE_TIME)
+            Pin(self.LTE_POWER_PIN, Pin.OUT).off()
+
+        # In entrambi i casi il modulo esegue una procedura di power-down
+        # che puo' richiedere fino a ~30s: attendere meno rischia di
+        # interromperla a meta' (rischio di danneggiare la flash interna,
+        # per nota esplicita del datasheet).
+        time.sleep(self.SHUTDOWN_SETTLE_TIME)
+
+        if self._is_module_on():
+            Logging.log_error("EG91 module did not power off as expected (still responsive)")
+            return False
+
         Logging.log_info("EG91 module shut down successfully")
-    
-    def _hard_reset(self):
+        return True
+
+    def _hard_reset(self) -> bool:
+        """
+        Reset hardware via RESET_N. E' un reset "a caldo" di un modulo GIA'
+        acceso: non ha effetto (e non riaccende) un modulo spento, quindi
+        va usato solo come estrema ratio per un modulo non rispondente
+        gia' alimentato, non come sostituto di _power_on().
+        """
+        if not self._is_module_on():
+            Logging.log_warning("EG91 module is powered off, RESET_N has no effect; use _power_on() instead")
+            return False
+
         Logging.log_info("Resetting EG91 module...")
         Pin(self.LTE_RESET_PIN, Pin.OUT).on()
         time.sleep_ms(self.RESET_TIME_STEP_1)
         Pin(self.LTE_RESET_PIN, Pin.OUT).off()
         time.sleep_ms(self.RESET_TIME_STEP_2)
+
+        if not self._is_module_on():
+            Logging.log_error("EG91 module did not respond after hardware reset")
+            return False
+
         Logging.log_info("EG91 module reset successfully")
         self._init_uart_interrupt()
-
-    def _soft_reset(self):
-        try:
-            self._send_command("AT+CFUN=1,1")
-            self._init_uart_interrupt()
-            return True
-        except Exception as e:
-            Logging.log_error(f"Failed to perform soft reset: \"{e}\"")
-            return False
+        return True
 
     def _init_uart_interrupt(self):
         """Initialize interrupt-based UART communication"""
@@ -196,12 +268,16 @@ class Eg91Sender():
         except Exception as e:
             Logging.untraced_log_error(f"UART IRQ handler error: \"{e}\"")
 
-    def _send_command(self, command, wait_time=None) -> str:
+    def _send_command(self, command, wait_time=None, quiet_on_timeout=False) -> str:
         """
         Send AT command using interrupt-based communication with improved error handling
 
         :param str command: AT command to send
         :param int wait_time: maximum wait time in milliseconds
+        :param bool quiet_on_timeout: se True, un timeout viene loggato come
+            debug invece che come errore. Da usare per i probe di stato
+            (es. _is_module_on()), dove un mancato responso e' un esito
+            atteso quando il modulo e' spento, non un vero errore.
         :return str: response
         """
 
@@ -239,11 +315,28 @@ class Eg91Sender():
 
             return response
         except TimeoutException as te:
-            Logging.log_error(f"Timeout occurred while sending command '{command}'")
+            if quiet_on_timeout:
+                Logging.log_debug(f"No response to '{command}' (timeout, expected for a state probe)")
+            else:
+                Logging.log_error(f"Timeout occurred while sending command '{command}'")
             raise TimeoutException()
         except Exception as e:
             Logging.log_error(f"Error sending command '{command}': \"{e}\"")
             raise Exception(f"Error sending command '{command}'")
+
+    def _is_module_on(self) -> bool:
+        """
+        Probe non distruttivo dello stato di alimentazione: invia "AT" e
+        verifica se il modulo risponde. Usato da _power_on()/_shut_down()/
+        _hard_reset() per sapere se un impulso PWRKEY/RESET_N va davvero
+        inviato, dato che PWRKEY commuta lo stato del modulo invece di
+        forzarlo.
+        """
+        try:
+            self._send_command("AT", quiet_on_timeout=True)
+            return True
+        except Exception:
+            return False
 
     def _check_network_registration(self) -> bool:
         """Check if device is registered to network"""
@@ -270,6 +363,11 @@ class Eg91Sender():
             Logging.log_info("Enabling EG91 sender module...")
 
             for attempt in range(self.MAX_RETRIES):
+                # Distingue "il modulo non risponde nemmeno ad AT" (giustifica
+                # un reset hardware) da "il modulo risponde ma un passo
+                # successivo e' fallito" (SIM/rete/PDP: un power-cycle
+                # regolare basta e disturba meno, vedi il ramo di retry sotto).
+                module_unresponsive = False
                 try:
 
                     # Clear rx buffer
@@ -279,7 +377,11 @@ class Eg91Sender():
                     Logging.log_debug("Starting basic configuration")
 
                     # Test basic communication
-                    response = self._send_command(command="AT")
+                    try:
+                        response = self._send_command(command="AT")
+                    except Exception:
+                        module_unresponsive = True
+                        raise
 
                     # Disable echo
                     response = self._send_command(command="ATE0")
@@ -311,20 +413,32 @@ class Eg91Sender():
                     self.ENABLED=True
 
                     return True
-                except TimeoutException as te:
+                except (TimeoutException, Exception) as e:
+                    if isinstance(e, TimeoutException):
+                        module_unresponsive = True
+
                     if attempt < self.MAX_RETRIES - 1:
-                        Logging.log_error(f"Enable attempt {attempt + 1} failed: \"{te}\".")
-                        self._hard_reset()
-                        Logging.log_info("Retrying to enable EG91 sender module...")
-                    else:
-                        Logging.log_error(f"EG91 enabling failed: \"{te}\"")
-                        return False
-                except Exception as e:
-                    if attempt < self.MAX_RETRIES - 1:
-                        Logging.log_error(f"Enable attempt {attempt + 1} failed: \"{e}\".")
-                        #if not self._soft_reset():
-                        #    self._hard_reset()
-                        self._hard_reset()
+                        if module_unresponsive:
+                            # Estrema ratio, come da datasheet Quectel: il
+                            # modulo non risponde nemmeno al comando "AT"
+                            # piu' semplice, quindi neppure AT+QPOWD
+                            # (tentato dentro _shut_down()) puo' funzionare
+                            # in queste condizioni. RESET_N e' l'unica via
+                            # rimasta per un modulo genuinamente bloccato.
+                            Logging.log_error(f"Enable attempt {attempt + 1} failed (module unresponsive): \"{e}\", retrying after hardware reset...")
+                            if not self._hard_reset():
+                                Logging.log_error("Hardware reset did not bring the module back up")
+                        else:
+                            # Il modulo risponde ai comandi AT: un fallimento
+                            # qui (SIM, registrazione di rete, PDP) non e' un
+                            # modulo "bloccato". Un power-cycle regolare
+                            # (spegnimento anche per via AT+QPOWD +
+                            # riaccensione) e' sufficiente e meno invasivo di
+                            # un reset hardware, che Quectel riserva
+                            # esplicitamente al caso di modulo non rispondente.
+                            Logging.log_error(f"Enable attempt {attempt + 1} failed: \"{e}\", retrying after power-cycle...")
+                            if not self._shut_down() or not self._power_on():
+                                Logging.log_error("Power-cycle did not complete as expected")
                         Logging.log_info("Retrying to enable EG91 sender module...")
                     else:
                         Logging.log_error(f"EG91 enabling failed: \"{e}\"")

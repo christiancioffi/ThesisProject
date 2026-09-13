@@ -15,6 +15,7 @@ class UARTRXManager():
             self._command_pending = False
             self._is_response_erroneous = False
             self._current_command = None
+            self._rx_buffer = ""
             self._reception_event=asyncio.ThreadSafeFlag()
             self._data_ready_event=asyncio.Event()
             self._parser=ATCommandsParser()
@@ -50,29 +51,42 @@ class UARTRXManager():
                             Logging.log_info(f"({self._uart_listener.__name__}) {len(raw_data)} bytes read from UART")
                             Logging.log_debug(f"({self._uart_listener.__name__}) Raw data: {raw_data}")
 
-                            data=""
+                            chunk=""
 
                             try:
-                                data=raw_data.decode('utf-8')
+                                chunk=raw_data.decode('utf-8')
                             except Exception as e:
-                                data=''.join(chr(b) for b in raw_data)
+                                chunk=''.join(chr(b) for b in raw_data)
 
                             if self._command_pending:
 
-                                response, error = self._parser.parse_response(self._current_command, data)
+                                # La risposta puo' arrivare spezzettata su piu' letture UART:
+                                # accumuliamo i chunk in un buffer persistente e proviamo il
+                                # parsing sul contenuto accumulato ad ogni nuovo dato ricevuto.
+                                self._rx_buffer += chunk
+
+                                if len(self._rx_buffer) > self._max_buffer_size:
+                                    Logging.log_error(f"({self._uart_listener.__name__}) RX buffer overflow ({len(self._rx_buffer)} bytes), buffer cleared")
+                                    self._rx_buffer = self._rx_buffer[-self._max_buffer_size:]
+
+                                response, error = self._parser.parse_response(self._current_command, self._rx_buffer)
 
                                 if response:
                                     self._last_response = response
                                     self._response_ready = True
                                     self._is_response_erroneous = False
+                                    self._rx_buffer = ""
                                     Logging.log_debug(f"({self._uart_listener.__name__}) Pending command response detected")
                                     self._data_ready_event.set()
-                                if error:
+                                elif error:
                                     self._last_response = error
                                     self._response_ready = True
                                     self._is_response_erroneous = True
+                                    self._rx_buffer = ""
                                     Logging.log_debug(f"({self._uart_listener.__name__}) Pending command error detected")
                                     self._data_ready_event.set()
+                                else:
+                                    Logging.log_debug(f"({self._uart_listener.__name__}) Response not yet complete, waiting for more data ({len(self._rx_buffer)} bytes buffered)")
                             else:
                                 Logging.log_debug(f"({self._uart_listener.__name__}) No command pending, data ignored")
                         else:
@@ -95,6 +109,7 @@ class UARTRXManager():
         self._command_pending = False
         self._current_command = None
         self._is_response_erroneous = False
+        self._rx_buffer = ""
     
     
     def clear_state(self):
@@ -112,6 +127,7 @@ class UARTRXManager():
                 self._command_pending = True
                 self._current_command = command
                 self._is_response_erroneous=False
+                self._rx_buffer = ""
         except Exception as e:
             Logging.log_error(f"Error while initializing pending state: \"{e}\"")
 
