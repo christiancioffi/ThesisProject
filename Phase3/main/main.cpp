@@ -14,7 +14,7 @@
 #include <regex>
 #include <string>
 #include <stdint.h>
-#include <stdexcept>  // std::exception, catturato attorno alle funzioni LTE
+#include <stdexcept>
 
 // Driver ESP32 e FreeRTOS
 #include "freertos/FreeRTOS.h"
@@ -51,11 +51,12 @@
 #define SD_MOUNT_POINT    "/sd"
 #define CSV_PATH SD_MOUNT_POINT "/predictions.csv"
 #define LOG_PATH SD_MOUNT_POINT "/Log/log.txt"
-#define SLEEP_BETWEEN_CYCLES_MS   (5 * 1000)      // 5 minuti (5 * 60 * 1000)   #TODO2
+#define SLEEP_BETWEEN_CYCLES_MS   (5 * 60 * 1000)      // 5 minuti (5 * 60 * 1000)
 #define SYNC_INTERVAL_SEC (12 * 3600) // 12 ore (in secondi)
-#define UPLOAD_INTERVAL_SEC (6) // 6 ore (in secondi) (6 * 3600)
+#define UPLOAD_INTERVAL_SEC (6 * 3600) // 6 ore (in secondi) (6 * 3600)
 #define MAX_SYNC_RETRIES 10
 #define UPLOAD_URL "https://tesi.aliagrid.com/predictions"    // ec2-3-122-216-71.eu-central-1.compute.amazonaws.com:8443
+#define DEBUG_MODE 0    //0 per disabilitare debug, 1 per abilitare debug
 
 #define AUDIO_DURATION_SEC 2
 #define SAMPLE_RATE_HZ 16000
@@ -583,24 +584,22 @@ extern "C" void app_main(void){
 
         // Aggiunge la predizione al CSV
         append_prediction_to_csv(iso_timestamp, prediction_int8, prediction_f32);
-        
-        // 2. Controllo e invio periodico del CSV al server (ogni 6 ore) - CORRETTO
-        if (should_upload_time()) {
-            send_predictions_to_server();
+
+        if(!DEBUG_MODE) {
+            // 2. Controllo e invio periodico del CSV al server (ogni 6 ore)
+            if (should_upload_time()) {
+                send_predictions_to_server();
+            }
+        }else{
+            // 3. Salvataggio del file audio locale
+            std::string safe_timestamp = time_buf;
+            std::replace(safe_timestamp.begin(), safe_timestamp.end(), ':', '-');
+
+            char percorso_audio[128];
+            snprintf(percorso_audio, sizeof(percorso_audio), "Audio/audio_%s.wav", safe_timestamp.c_str());
+
+            save_audio(pcm_buffer, TOTAL_SAMPLES, percorso_audio);
         }
-        
-        /*
-
-        // 3. Salvataggio del file audio locale
-        std::string safe_timestamp = time_buf;
-        std::replace(safe_timestamp.begin(), safe_timestamp.end(), ':', '-');
-
-        char percorso_audio[128];
-        snprintf(percorso_audio, sizeof(percorso_audio), "Audio/audio_%s.wav", safe_timestamp.c_str());
-
-        save_audio(pcm_buffer, TOTAL_SAMPLES, percorso_audio);
-        
-        */
 
         
         Logger::instance().info(LOG_TAG, "Sleeping for %d ms before next cycle...", SLEEP_BETWEEN_CYCLES_MS);

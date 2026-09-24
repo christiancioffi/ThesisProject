@@ -37,8 +37,8 @@ const float SPEC_TRAIN_MEAN   = -60.619049072265625f;
 const float SPEC_TRAIN_STD    = 12.7423095703125f;   
 
 // Parametri delle Labels (Portate) calcolate sul subset di Training
-const float LABELS_TRAIN_MEAN = 0.3859245630174793f;  
-const float LABELS_TRAIN_STD  = 0.1672968350905522f;
+const float LABELS_TRAIN_MEAN = 0.0964811407543698f;  
+const float LABELS_TRAIN_STD  = 0.04182420877263805f;
 
 // Dimensione dell'arena per TFLite Quantizzato (i modelli int8 occupano meno RAM)
 const int TFLITE_ARENA_SIZE = 100 * 1024;   //100 per CNN1D, 200 per CNN_RNN
