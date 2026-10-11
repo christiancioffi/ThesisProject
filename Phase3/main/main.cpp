@@ -519,7 +519,6 @@ extern "C" void app_main(void){
         Logger::instance().info(LOG_TAG, "========== End audio recording ==========");
 
         int64_t ts = get_timestamp_ms();
-        ts -= 500;                              // Per il preprocessing
 
         time_t sec = ts / 1000;
         int ms = ts % 1000;
@@ -539,7 +538,7 @@ extern "C" void app_main(void){
             continue;
         }
 
-        // Spettrogramma calcolato UNA VOLTA SOLA (filtro/trimming/Mel-spectrogram
+        // Spettrogramma calcolato UNA VOLTA SOLA (rimozioneDCOffset/trimming/Mel-spectrogram
         // sono identici per le due varianti: dipendono solo dall'audio, non dal modello).
         MelSpectrogram spectrogram = compute_spectrogram_from_audio(pcm_buffer, TOTAL_SAMPLES);
         if (spectrogram.data == nullptr) {

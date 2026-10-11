@@ -16,12 +16,10 @@
 
 #include "CNN.h"
 #include "MelSpectrogram.h"
-#include "filter_module.h"
-#include "filter_coeffs.h"
 #include "Logger.h"
 
 #define SAMPLE_RATE_HZ 16000
-#define OFFSET_TO_CUT 0.5
+#define OFFSET_TO_CUT 1.0   // secondi da rimuovere all'inizio dell'audio
 #define FRAME_SIZE 2048
 #define HOP_SIZE 512
 #define N_MELS 128
@@ -33,12 +31,12 @@
 #define LOG_TAG "INFERENCE"
 
 // Parametri dello Spettrogramma calcolati sul subset di Training
-const float SPEC_TRAIN_MEAN   = -60.619049072265625f;  
-const float SPEC_TRAIN_STD    = 12.7423095703125f;   
+const float SPEC_TRAIN_MEAN   = -54.63789749145508f;  
+const float SPEC_TRAIN_STD    = 12.428064346313477f;   
 
 // Parametri delle Labels (Portate) calcolate sul subset di Training
-const float LABELS_TRAIN_MEAN = 0.0964811407543698f;  
-const float LABELS_TRAIN_STD  = 0.04182420877263805f;
+const float LABELS_TRAIN_MEAN = 0.09537983073314975f;  
+const float LABELS_TRAIN_STD  = 0.04158546174237766f;
 
 // Dimensione dell'arena per TFLite Quantizzato (i modelli int8 occupano meno RAM)
 const int TFLITE_ARENA_SIZE = 100 * 1024;   //100 per CNN1D, 200 per CNN_RNN
@@ -185,59 +183,50 @@ MelSpectrogram compute_spectrogram_from_audio(int32_t* pcm_buffer, size_t total_
         Logger::instance().info(LOG_TAG, "AUDIO_BUFFER: Min: %.8f, Max: %.8f\n", min_val_f, max_val_f);
     }
 
-    //-----------------FILTRO PASSA-ALTO-------------------
+    Logger::instance().info(LOG_TAG, "Audio preprocessing: DC offset removal and trimming...\n");
 
-    Logger::instance().info(LOG_TAG, "Audio preprocessing: High-pass filter and trimming...\n");
-
-    float* filtered_audio_buffer = (float*)heap_caps_calloc(total_samples, sizeof(float), MALLOC_CAP_SPIRAM);
-    if (filtered_audio_buffer == nullptr) {
-        Logger::instance().error(LOG_TAG, "Allocation of filtered_audio_buffer failed");
-        heap_caps_free(audio_buffer);
-        return MelSpectrogram();
+    // Rimozione del DC offset (sottrazione della media del segnale)
+    double sum = 0.0;
+    for (size_t i = 0; i < total_samples; i++) {
+        sum += audio_buffer[i];
     }
-
-    if (!apply_sosfiltfilt(audio_buffer, filtered_audio_buffer, total_samples, sos_coeffs, NUM_SECTIONS)) {
-        Logger::instance().error(LOG_TAG, "Error during application of sosfiltfilt filter");
-        heap_caps_free(audio_buffer);
-        heap_caps_free(filtered_audio_buffer);
-        return MelSpectrogram();
+    const float dc_offset = (float)(sum / (double)total_samples);
+    for (size_t i = 0; i < total_samples; i++) {
+        audio_buffer[i] -= dc_offset;
     }
-
-    heap_caps_free(audio_buffer);
-    audio_buffer = nullptr;
 
     if (DEBUG_MODE) {
-        float min_val_f = filtered_audio_buffer[0];
-        float max_val_f = filtered_audio_buffer[0];
+        float min_val_f = audio_buffer[0];
+        float max_val_f = audio_buffer[0];
         for (size_t i = 0; i < total_samples; i++) {
-            if (filtered_audio_buffer[i] < min_val_f) min_val_f = filtered_audio_buffer[i];
-            if (filtered_audio_buffer[i] > max_val_f) max_val_f = filtered_audio_buffer[i];
+            if (audio_buffer[i] < min_val_f) min_val_f = audio_buffer[i];
+            if (audio_buffer[i] > max_val_f) max_val_f = audio_buffer[i];
         }
-        Logger::instance().info(LOG_TAG, "AUDIO AFTER HIGH-PASS FILTER: Min: %.8f, Max: %.8f\n", min_val_f, max_val_f);
+        Logger::instance().info(LOG_TAG, "AUDIO AFTER DC OFFSET REMOVAL (offset: %.8f): Min: %.8f, Max: %.8f\n", dc_offset, min_val_f, max_val_f);
     }
 
     //-----------------TAGLIO-------------------
 
     int trim_samples = OFFSET_TO_CUT * SAMPLE_RATE_HZ;
-    int total_samples_after_cut = total_samples - (2 * trim_samples);
+    int total_samples_after_cut = (int)total_samples - trim_samples;
 
     if (total_samples_after_cut <= 0) {
         Logger::instance().error(LOG_TAG, "total_samples_after_cut <= 0, audio troppo corto per il trimming configurato");
-        heap_caps_free(filtered_audio_buffer);
+        heap_caps_free(audio_buffer);
         return MelSpectrogram();
     }
 
     float* preprocessed_audio_buffer = (float*)heap_caps_calloc(total_samples_after_cut, sizeof(float), MALLOC_CAP_SPIRAM);
     if (preprocessed_audio_buffer == nullptr) {
         Logger::instance().error(LOG_TAG, "Allocation of preprocessed_audio_buffer failed");
-        heap_caps_free(filtered_audio_buffer);
+        heap_caps_free(audio_buffer);
         return MelSpectrogram();
     }
 
-    memcpy(preprocessed_audio_buffer, &filtered_audio_buffer[trim_samples], total_samples_after_cut * sizeof(float));
+    memcpy(preprocessed_audio_buffer, &audio_buffer[trim_samples], total_samples_after_cut * sizeof(float));
 
-    heap_caps_free(filtered_audio_buffer);
-    filtered_audio_buffer = nullptr;
+    heap_caps_free(audio_buffer);
+    audio_buffer = nullptr;
 
     if (DEBUG_MODE) {
         float min_val_f = preprocessed_audio_buffer[0];
